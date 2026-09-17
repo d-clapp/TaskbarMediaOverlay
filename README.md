@@ -5,8 +5,7 @@ currently playing title, artist, album art, and a progress bar. Works
 with Spotify, YouTube in a browser tab, VLC, and anything else that reports
 to Windows' media controls.
 
-Settings (which monitors to show it on, position, etc.) are in the system
-tray icon - right-click it.
+Settings available by right clicking the system tray icon.
 
 ## Requirements
 
