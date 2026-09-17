@@ -7,6 +7,8 @@ to Windows' media controls.
 
 Settings available by right clicking the system tray icon.
 
+![Screenshot of the widget showing a currently playing song](screenshot.png)
+
 ## Requirements
 
 - Windows 10/11
