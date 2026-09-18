@@ -19,6 +19,7 @@ import asyncio
 import ctypes
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -69,8 +70,34 @@ MEDIA_SOURCE_LABELS = {
     MEDIA_SOURCE_SPOTIFY_ONLY: "Spotify Only",
     MEDIA_SOURCE_ALL: "All Media",
 }
-# Firefox doesn't report its exe name to Windows, so it won't match here.
 BROWSER_APP_IDS = ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe")
+# Firefox reports a random ID instead of its exe name, so it won't match
+# BROWSER_APP_IDS - resolve_friendly_name() below looks up its real name
+# instead, and this is what we match that name against.
+BROWSER_NAME_HINTS = ("firefox", "chrome", "edge", "brave", "opera", "vivaldi")
+
+_friendly_name_cache = {}
+
+
+def resolve_friendly_name(app_id):
+    """Looks up the human-readable app name Windows shows in the Start
+    Menu for an app id, using the same lookup Get-StartApps uses. Cached
+    since it spawns a PowerShell process and is a bit slow."""
+    if app_id in _friendly_name_cache:
+        return _friendly_name_cache[app_id]
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", f"(Get-StartApps | Where-Object {{$_.AppID -eq '{app_id}'}}).Name"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        name = result.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        name = None
+    _friendly_name_cache[app_id] = name
+    return name
 
 SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "TaskbarMediaOverlay")
 SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
@@ -199,6 +226,18 @@ def get_taskbar_rects():
 # These window classes cover a whole monitor without being a fullscreen app.
 _NOT_FULLSCREEN = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
 
+DWMWA_CLOAKED = 14
+
+
+def _is_cloaked(hwnd):
+    # Some background UWP windows (e.g. "Windows Input Experience") report
+    # as visible and full-monitor-sized even though nothing is drawn -
+    # DWM's cloaked flag is how Windows itself tells them apart from a
+    # window that's actually on screen.
+    cloaked = ctypes.c_int(0)
+    ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+    return cloaked.value != 0
+
 
 def monitor_has_fullscreen_window(monitor_rect):
     """True if some window's bounds exactly match the monitor."""
@@ -212,15 +251,18 @@ def monitor_has_fullscreen_window(monitor_rect):
             return True
         if win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE) & win32con.WS_EX_TOOLWINDOW:
             return True
-        if win32gui.GetWindowRect(hwnd) == monitor_rect:
-            found = True
+        if win32gui.GetWindowRect(hwnd) != monitor_rect:
+            return True
+        if _is_cloaked(hwnd):
+            return True
+        found = True
         return True
 
     win32gui.EnumWindows(callback, None)
     return found
 
 
-def media_source_matches(app_id, mode):
+def media_source_matches(app_id, friendly_name, mode):
     app_id = (app_id or "").lower()
     if not app_id:
         return False
@@ -229,7 +271,8 @@ def media_source_matches(app_id, mode):
     is_spotify = "spotify" in app_id
     if mode == MEDIA_SOURCE_SPOTIFY_ONLY:
         return is_spotify
-    is_browser = any(b in app_id for b in BROWSER_APP_IDS)
+    name = (friendly_name or "").lower()
+    is_browser = any(b in app_id for b in BROWSER_APP_IDS) or any(b in name for b in BROWSER_NAME_HINTS)
     return is_spotify or is_browser
 
 
@@ -242,6 +285,7 @@ class NowPlaying:
         self._title = ""
         self._artist = ""
         self._app_id = ""
+        self._friendly_name = None
         self._playing = False
         self._thumbnail = None
         self._position_seconds = 0.0
@@ -251,11 +295,12 @@ class NowPlaying:
         self._position_mode = POSITION_CENTER
         self._media_source_mode = MEDIA_SOURCE_SPOTIFY_AND_BROWSERS
 
-    def update(self, title, artist, app_id, playing, thumbnail, position_seconds, duration_seconds):
+    def update(self, title, artist, app_id, friendly_name, playing, thumbnail, position_seconds, duration_seconds):
         with self._lock:
             self._title = title
             self._artist = artist
             self._app_id = app_id
+            self._friendly_name = friendly_name
             self._playing = playing
             self._thumbnail = thumbnail
             self._position_seconds = position_seconds
@@ -267,6 +312,7 @@ class NowPlaying:
                 self._title,
                 self._artist,
                 self._app_id,
+                self._friendly_name,
                 self._playing,
                 self._thumbnail,
                 self._position_seconds,
@@ -337,37 +383,68 @@ def read_timeline(session):
         return 0.0, 0.0
 
 
+def pick_session(manager):
+    """Windows can track several media sessions at once (e.g. Spotify and a
+    browser tab), but get_current_session() only ever returns one of them,
+    picked by Windows' own idea of "current" - which can be a paused app
+    while something else is actually playing. Prefer whichever session is
+    actually playing instead."""
+    sessions = list(manager.get_sessions())
+    for session in sessions:
+        try:
+            if session.get_playback_info().playback_status == PlaybackStatus.PLAYING:
+                return session
+        except OSError:
+            continue
+    return manager.get_current_session()
+
+
 async def poll_loop(state, stop_event):
     manager = await MediaManager.request_async()
     last_title, last_artist, last_thumbnail = None, None, None
+    last_app_id, last_friendly_name = None, None
 
     while not stop_event.is_set():
-        session = manager.get_current_session()
-        if session is None:
-            last_title = last_artist = last_thumbnail = None
-            state.update("", "", "", False, None, 0.0, 0.0)
-        else:
-            info = await session.try_get_media_properties_async()
-            playback_info = session.get_playback_info()
-            playing = playback_info is not None and playback_info.playback_status == PlaybackStatus.PLAYING
-            title = info.title or ""
-            artist = info.artist or ""
+        try:
+            session = pick_session(manager)
+            if session is None:
+                last_title = last_artist = last_thumbnail = None
+                last_app_id = last_friendly_name = None
+                state.update("", "", "", None, False, None, 0.0, 0.0)
+            else:
+                info = await session.try_get_media_properties_async()
+                playback_info = session.get_playback_info()
+                playing = playback_info is not None and playback_info.playback_status == PlaybackStatus.PLAYING
+                title = info.title or ""
+                artist = info.artist or ""
+                app_id = session.source_app_user_model_id or ""
 
-            # Only re-fetch the thumbnail when the track actually changed.
-            if title != last_title or artist != last_artist:
-                last_thumbnail = await read_thumbnail(info.thumbnail)
-                last_title, last_artist = title, artist
+                # Only re-fetch the thumbnail when the track actually changed.
+                if title != last_title or artist != last_artist:
+                    last_thumbnail = await read_thumbnail(info.thumbnail)
+                    last_title, last_artist = title, artist
 
-            position, duration = read_timeline(session)
-            state.update(
-                title=title,
-                artist=artist,
-                app_id=session.source_app_user_model_id or "",
-                playing=playing,
-                thumbnail=last_thumbnail,
-                position_seconds=position,
-                duration_seconds=duration,
-            )
+                # resolve_friendly_name() shells out to PowerShell, so only
+                # do it when the app changed, off the main loop's thread.
+                if app_id != last_app_id:
+                    last_friendly_name = await asyncio.to_thread(resolve_friendly_name, app_id)
+                    last_app_id = app_id
+
+                position, duration = read_timeline(session)
+                state.update(
+                    title=title,
+                    artist=artist,
+                    app_id=app_id,
+                    friendly_name=last_friendly_name,
+                    playing=playing,
+                    thumbnail=last_thumbnail,
+                    position_seconds=position,
+                    duration_seconds=duration,
+                )
+        except Exception:
+            # A single bad read (e.g. a session closing mid-read) shouldn't
+            # kill this loop forever - just try again next tick.
+            pass
 
         await asyncio.sleep(POLL_INTERVAL_MS / 1000)
 
@@ -564,7 +641,7 @@ class OverlayApp:
             height = max(t_bottom - t_top - 4, 30)
             y = t_top + (t_bottom - t_top - height) // 2
             if self.state.get_position_mode() == POSITION_RIGHT:
-                x = t_right - TRAY_ICONS_WIDTH - width
+                x = max(t_right - TRAY_ICONS_WIDTH - width, t_left)
             else:
                 x = (t_left + t_right) // 2 - width // 2
         else:
@@ -603,8 +680,8 @@ class OverlayApp:
         try:
             monitors = self._sync_monitors()
             hide_on_fullscreen = self.state.get_hide_on_fullscreen()
-            title, artist, app_id, playing, thumbnail, position, duration = self.state.snapshot()
-            source_matches = media_source_matches(app_id, self.state.get_media_source_mode())
+            title, artist, app_id, friendly_name, playing, thumbnail, position, duration = self.state.snapshot()
+            source_matches = media_source_matches(app_id, friendly_name, self.state.get_media_source_mode())
 
             now = time.monotonic()
             if source_matches and title and playing:

@@ -1,6 +1,7 @@
 winrt-Windows.Media.Control
 winrt-Windows.Storage.Streams
 winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections
 Pillow
 pystray
 pywin32
