@@ -95,7 +95,7 @@ def resolve_friendly_name(app_id):
         )
         name = result.stdout.strip() or None
     except (OSError, subprocess.SubprocessError):
-        name = None
+        return None  # don't cache a failure - it might just be transient
     _friendly_name_cache[app_id] = name
     return name
 
@@ -383,19 +383,36 @@ def read_timeline(session):
         return 0.0, 0.0
 
 
-def pick_session(manager):
+async def pick_session(manager, mode):
     """Windows can track several media sessions at once (e.g. Spotify and a
     browser tab), but get_current_session() only ever returns one of them,
     picked by Windows' own idea of "current" - which can be a paused app
     while something else is actually playing. Prefer whichever session is
-    actually playing instead."""
+    actually playing instead - and if more than one is playing at once,
+    prefer whichever one actually matches the current Media Source filter,
+    so e.g. a live YouTube stream playing alongside Spotify doesn't get
+    hidden just because the other one happened to be picked first. When
+    both are playing and both would match, Spotify wins the tie."""
     sessions = list(manager.get_sessions())
+    playing = []
     for session in sessions:
         try:
             if session.get_playback_info().playback_status == PlaybackStatus.PLAYING:
-                return session
+                playing.append(session)
         except OSError:
             continue
+
+    playing.sort(key=lambda s: "spotify" not in (s.source_app_user_model_id or "").lower())
+
+    if len(playing) > 1:
+        for session in playing:
+            app_id = session.source_app_user_model_id or ""
+            friendly_name = await asyncio.to_thread(resolve_friendly_name, app_id)
+            if media_source_matches(app_id, friendly_name, mode):
+                return session
+
+    if playing:
+        return playing[0]
     return manager.get_current_session()
 
 
@@ -406,7 +423,7 @@ async def poll_loop(state, stop_event):
 
     while not stop_event.is_set():
         try:
-            session = pick_session(manager)
+            session = await pick_session(manager, state.get_media_source_mode())
             if session is None:
                 last_title = last_artist = last_thumbnail = None
                 last_app_id = last_friendly_name = None
